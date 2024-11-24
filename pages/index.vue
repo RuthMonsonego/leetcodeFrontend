@@ -1,48 +1,76 @@
 <template>
   <div class="dashboard">
-    <div class="sidebar">
-      <ul>
-        <li v-for="question in questions" :key="question.id" @click="selectQuestion(question)">
-          {{ question.title }}
-        </li>
-      </ul>
-      <button @click="openModal('add')">Add</button>
-    </div>
-    <div class="content">
-      <div v-if="selectedQuestion">
-        <h2>{{ selectedQuestion.title }}</h2>
-        <p>{{ selectedQuestion.description }}</p>
-        <button @click="openModal('update')">Update</button>
-        <button @click="deleteQuestion(selectedQuestion.id)">Delete</button>
-      </div>
-    </div>
-    <div class="editor">
-      <textarea v-model="userCode" placeholder="Enter your code here"></textarea>
-      <button @click="runCode">Run</button>
-    </div>
-    <nuxt-ui-modal v-if="showModal" @close="closeModal">
-      <div v-if="modalType === 'add' || modalType === 'update'">
-        <input v-model="formData.title" placeholder="Title" />
-        <input v-model="formData.description" placeholder="Description" />
-        <button @click="submitForm">{{ modalType === 'add' ? 'Add' : 'Update' }}</button>
-      </div>
-    </nuxt-ui-modal>
+    <Sidebar 
+      :questions="questions" 
+      @select="selectQuestion" 
+      @open-modal="openModal" 
+    />
+    <Content 
+      :selectedQuestion="selectedQuestion" 
+      :apiError="apiError" 
+      @open-modal="openModal" 
+      @delete="deleteQuestion" 
+    />
+    <Editor 
+      :goTemplate="selectedQuestion?.template_for_go || ''" 
+      :pythonTemplate="selectedQuestion?.template_for_python || ''"
+      :questionId="selectedQuestion?.id"
+      :parameters="selectedQuestion?.parameters || []"
+      @execute="executeCode"
+    />
+    <Modal 
+      :show="showModal" 
+      :type="modalType" 
+      :questionData="selectedQuestion"
+      @close="closeModal" 
+      @submit="submitForm" 
+    />
   </div>
 </template>
 
 <script>
+import Sidebar from '../components/Sidebar.vue'
+import Content from '../components/Content.vue'
+import Editor from '../components/Editor.vue'
+import Modal from '../components/Modal.vue'
+
+const API_BASE_URL = process.env.VUE_APP_API_URL || 'http://localhost:8080';
+
+async function fetchWithConfig(url, options = {}) {
+  const config = {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options.headers
+    }
+  };
+
+  const response = await fetch(`${API_BASE_URL}${url}`, config);
+  const data = await response.json();
+  
+  if (!response.ok) {
+    throw new Error(data.error || 'API request failed');
+  }
+  
+  return data;
+}
+
 export default {
+  name: 'Dashboard',
+  components: {
+    Sidebar,
+    Content,
+    Editor,
+    Modal
+  },
   data() {
     return {
       questions: [],
       selectedQuestion: null,
-      userCode: '',
       showModal: false,
       modalType: '',
-      formData: {
-        title: '',
-        description: ''
-      }
+      apiError: false,
+      isLoading: false
     }
   },
   async mounted() {
@@ -50,107 +78,155 @@ export default {
   },
   methods: {
     async fetchQuestions() {
-      const response = await fetch('http://localhost:8080/questions');
-      this.questions = await response.json();
+      try {
+        this.isLoading = true;
+        const questions = await fetchWithConfig('/questions');
+        this.questions = questions;
+        this.apiError = false;
+      } catch (error) {
+        await this.handleApiError(error, 'fetch questions');
+      } finally {
+        this.isLoading = false;
+      }
     },
+
     selectQuestion(question) {
       this.selectedQuestion = question;
     },
+
     openModal(type) {
       this.modalType = type;
       this.showModal = true;
     },
+
     closeModal() {
       this.showModal = false;
+      if (this.modalType === 'add') {
+        this.selectedQuestion = null;
+      }
     },
-    async submitForm() {
-      const method = this.modalType === 'add' ? 'POST' : 'PUT';
-      const url = this.modalType === 'add' ? 'http://localhost:8080/questions' : `http://localhost:8080/questions/${this.selectedQuestion.id}`;
-      await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(this.formData)
-      });
-      this.closeModal();
-      await this.fetchQuestions();
+
+    async submitForm(formData) {
+      try {
+        this.isLoading = true;
+        const method = this.modalType === 'add' ? 'POST' : 'PUT';
+        const url = this.modalType === 'add' 
+          ? '/questions' 
+          : `/questions/${this.selectedQuestion.id}`;
+        
+        await fetchWithConfig(url, {
+          method,
+          body: JSON.stringify(formData)
+        });
+
+        await this.fetchQuestions();
+        
+        if (this.modalType === 'update') {
+          const updatedQuestion = this.questions.find(q => q.id === this.selectedQuestion.id);
+          this.selectQuestion(updatedQuestion);
+        }
+        
+        this.closeModal();
+      } catch (error) {
+        await this.handleApiError(error, 'submit form');
+      } finally {
+        this.isLoading = false;
+      }
     },
+
     async deleteQuestion(id) {
-      await fetch(`http://localhost:8080/questions/${id}`, { method: 'DELETE' });
-      await this.fetchQuestions();
+      try {
+        this.isLoading = true;
+        await fetchWithConfig(`/questions/${id}`, { method: 'DELETE' });
+        this.selectedQuestion = null;
+        await this.fetchQuestions();
+      } catch (error) {
+        await this.handleApiError(error, 'delete question');
+      } finally {
+        this.isLoading = false;
+      }
     },
-    runCode() {
-      // Implement code execution logic
+
+    async executeCode(codeData, callback) {
+      if (!this.selectedQuestion) return;
+      
+      try {
+        this.isLoading = true;
+        
+        const requestBody = {
+          user_execution_code: codeData.user_execution_code,
+          language: codeData.language,
+          question_code: this.selectedQuestion.id,
+          arguments: codeData.arguments
+        };
+
+        const response = await fetch(`${API_BASE_URL}/questions/${this.selectedQuestion.id}/test`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(requestBody)
+        });
+
+        const data = await response.json();
+        console.log('Raw API Response:', data);
+
+        if (!response.ok) {
+          throw new Error(data.error || data.message || 'Failed to execute code');
+        }
+
+        callback(data);
+        
+      } catch (error) {
+        console.error('Execute code error:', error);
+        callback({ error: error.message });
+      } finally {
+        this.isLoading = false;
+      }
+    },
+
+    async handleApiError(error, action) {
+      console.error(`Failed to ${action}:`, error);
+      this.apiError = true;
+      const errorMessage = error.response?.data?.error || error.message || `Failed to ${action}`;
+      alert(errorMessage);
     }
   }
 }
 </script>
 
-<style>
+<style scoped>
 .dashboard {
-  display: flex;
+  display: grid;
+  grid-template-columns: 250px 1fr 1fr;
   height: 100vh;
-  font-family: Arial, sans-serif;
+  overflow: hidden;
 }
 
-.sidebar {
-  background-color: #34495e;
-  color: white;
-  width: 20%;
-  padding: 20px;
-  box-shadow: 2px 0 5px rgba(0, 0, 0, 0.1);
-}
-
-.sidebar ul {
-  list-style-type: none;
-  padding: 0;
-}
-
-.sidebar li {
-  margin: 10px 0;
-  cursor: pointer;
-  transition: background-color 0.3s;
-}
-
-.sidebar li:hover {
-  background-color: #2c3e50;
-}
-
-.content {
-  background-color: #ecf0f1;
-  width: 40%;
-  padding: 20px;
-  overflow-y: auto;
-}
-
-.editor {
-  background-color: #bdc3c7;
-  width: 40%;
-  padding: 20px;
+.loading-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.8);
   display: flex;
-  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  z-index: 9999;
 }
 
-textarea {
-  width: 100%;
-  height: 200px;
-  margin-bottom: 10px;
-  padding: 10px;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-  resize: none;
+.loading-spinner {
+  border: 4px solid #f3f3f3;
+  border-top: 4px solid #3498db;
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  animation: spin 1s linear infinite;
 }
 
-button {
-  background-color: #3498db;
-  color: white;
-  border: none;
-  padding: 10px 20px;
-  cursor: pointer;
-  border-radius: 4px;
-  transition: background-color 0.3s;
-}
-
-button:hover {
-  background-color: #2980b9;
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
 }
 </style>
